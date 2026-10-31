@@ -56,7 +56,12 @@ def gemini_json(prompt):
     for model in gemini_models(key):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         for attempt in range(2):
-            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=180)
+            try:
+                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=90)
+            except requests.RequestException as e:
+                last = f"{model}: {type(e).__name__} (90 sec mein jawab nahi aaya)"
+                print("  Gemini fail ->", last)
+                break      # is model ko chhodo, agla model try karo
             if r.status_code == 200:
                 try:
                     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
