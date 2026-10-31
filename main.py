@@ -28,24 +28,50 @@ def log(msg): print(f"▶ {msg}", flush=True)
 
 
 # ---------- 1. SCRIPT (Gemini free tier) ----------
+def gemini_models(key):
+    """Preferred model first, then every other text 'flash' model this key can use (names change often)."""
+    first = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+    names = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", headers={"x-goog-api-key": key},
+                         params={"pageSize": 200}, timeout=60)
+        for m in r.json().get("models", []):
+            n = m["name"].split("/")[-1]
+            if "generateContent" in m.get("supportedGenerationMethods", []) and "flash" in n \
+                    and not any(x in n for x in ("image", "tts", "audio", "live", "robot", "computer", "native")):
+                names.append(n)
+    except Exception as e:
+        print("  model list nahi mili:", e)
+    names.sort(key=lambda n: ("lite" in n, [-ord(c) for c in n]))
+    return [first] + [n for n in names if n != first][:5]
+
+
 def gemini_json(prompt):
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         sys.exit("GEMINI_API_KEY set karo (free: https://aistudio.google.com/apikey)")
-    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
-    for attempt in range(5):
-        r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=180)
-        if r.status_code == 200:
-            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-            return json.loads(text)
-        if r.status_code in (429, 500, 503):
-            time.sleep(8 * (attempt + 1)); continue
-        sys.exit(f"Gemini error {r.status_code}: {r.text[:300]}")
-    sys.exit("Gemini busy hai, thodi der baad try karo.")
+    last = ""
+    for model in gemini_models(key):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(2):
+            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=180)
+            if r.status_code == 200:
+                try:
+                    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+                    data = json.loads(text)
+                    print(f"  Gemini model: {model}")
+                    return data
+                except Exception as e:
+                    last = f"{model}: bad JSON ({e})"; print("  ", last); continue
+            last = f"{model}: HTTP {r.status_code} {r.text[:200]!r}"
+            print("  Gemini fail ->", last)
+            if r.status_code in (429, 500, 503):
+                time.sleep(10); continue
+            break          # 404/400/403: is model ko chhodo, agla try karo
+    sys.exit("Gemini kisi model par nahi chala. Aakhri error: " + last)
 
 
 def write_script(topic, style, lang, fmt, n):
@@ -375,4 +401,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-          
