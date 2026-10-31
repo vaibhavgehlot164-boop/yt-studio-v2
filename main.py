@@ -1,5 +1,5 @@
 """YT Auto Studio v2: energetic comedy 3D-cartoon explainer videos. Free tools only."""
-import argparse, asyncio, json, os, random, sys
+import argparse, asyncio, json, os, random, re, sys
 from datetime import datetime
 from pathlib import Path
 
@@ -32,9 +32,29 @@ from imagegen import make_image
 
 
 # ---------- 3. VOICEOVER (edge-tts, free, energetic settings) ----------
+def clean_voice(text):
+    """Emoji, brackets, markdown etc. hatao: TTS inpar 'No audio received' deta hai."""
+    t = re.sub(r"[^A-Za-z0-9\u0900-\u097F\s.,!?'\-]", " ", str(text))
+    return re.sub(r"\s+", " ", t).strip()
+
+
 async def tts(text, voice, out):
-    await edge_tts.Communicate(text, voice, rate=os.environ.get("TTS_RATE", "+10%"),
-                               pitch=os.environ.get("TTS_PITCH", "+2Hz")).save(str(out))
+    text = clean_voice(text)
+    if not re.search(r"[A-Za-z0-9\u0900-\u097F]", text):
+        raise ValueError("voice line khali hai")
+    rate, pitch = os.environ.get("TTS_RATE", "+10%"), os.environ.get("TTS_PITCH", "+2Hz")
+    tries = [(voice, rate, pitch), (voice, rate, pitch), (voice, "+0%", "+0Hz"),
+             ("hi-IN-SwaraNeural" if voice.startswith("hi-") else "en-US-JennyNeural", "+0%", "+0Hz")]
+    last = None
+    for v, r, p in tries:
+        try:
+            await edge_tts.Communicate(text, v, rate=r, pitch=p).save(str(out))
+            if Path(out).exists() and Path(out).stat().st_size > 1000:
+                return
+        except Exception as e:
+            last = e; print(f"  voice retry ({v}): {type(e).__name__}")
+        await asyncio.sleep(2)
+    raise RuntimeError(f"voice nahi bani: {last}")
 
 
 # ---------- 4. CAPTIONS, MOTION, VIDEO ----------
@@ -187,8 +207,14 @@ def main():
         log(f"Scene {i + 1}/{len(scenes)}: image + voice")
         img = out / f"scene{i + 1}.jpg"; mp3 = out / f"scene{i + 1}.mp3"
         make_image(s["image_prompt"], img, W, H, random.randint(1, 10**6), s.get("keywords", ""))
-        asyncio.run(tts(s["voice"], voice, mp3))
+        try:
+            asyncio.run(tts(s["voice"], voice, mp3))
+        except Exception as e:
+            print(f"  ⚠ Scene {i + 1} ki voice nahi bani, ye scene chhod raha hu: {e}")
+            continue
         clips.append(build_scene(i, s.get("caption") or s["voice"], img, mp3, W, H))
+    if not clips:
+        sys.exit("Koi bhi scene nahi bana (voice fail). Logs bhej do.")
 
     log("Video jod raha hu (thoda time lagega)...")
     final = concatenate_videoclips(clips, method="compose")
@@ -210,4 +236,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
