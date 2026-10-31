@@ -29,7 +29,7 @@ def log(msg): print(f"▶ {msg}", flush=True)
 
 # ---------- 1. SCRIPT (Gemini free tier) ----------
 def gemini_models(key):
-    """Preferred model first, then every other text 'flash' model this key can use (names change often)."""
+    """Preferred model first, then other stable text 'flash' models this key can use (names change often)."""
     first = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     names = []
     try:
@@ -38,12 +38,41 @@ def gemini_models(key):
         for m in r.json().get("models", []):
             n = m["name"].split("/")[-1]
             if "generateContent" in m.get("supportedGenerationMethods", []) and "flash" in n \
-                    and not any(x in n for x in ("image", "tts", "audio", "live", "robot", "computer", "native")):
+                    and not any(x in n for x in ("image", "tts", "audio", "live", "robot", "computer", "native",
+                                                 "preview", "omni", "exp")):
                 names.append(n)
     except Exception as e:
         print("  model list nahi mili:", e)
     names.sort(key=lambda n: ("lite" in n, [-ord(c) for c in n]))
-    return [first] + [n for n in names if n != first][:5]
+    return [first] + [n for n in names if n != first][:4]
+
+
+def valid_script(d):
+    return isinstance(d, dict) and isinstance(d.get("scenes"), list) and len(d["scenes"]) > 0 \
+        and all(isinstance(x, dict) and x.get("voice") and x.get("image_prompt") for x in d["scenes"])
+
+
+def cloudflare_json(prompt):
+    """Backup writer when Gemini is overloaded: Cloudflare Workers AI (same free token as images)."""
+    acc, tok = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_API_TOKEN")
+    if not (acc and tok):
+        return None
+    model = os.environ.get("CF_TEXT_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+    try:
+        r = requests.post(f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/{model}",
+                          headers={"Authorization": "Bearer " + tok},
+                          json={"messages": [{"role": "system", "content": "You output only valid JSON, nothing else."},
+                                             {"role": "user", "content": prompt}],
+                                "max_tokens": 6000, "temperature": 0.9}, timeout=180)
+        if r.status_code != 200:
+            print(f"  Cloudflare text: HTTP {r.status_code} {r.text[:150]!r}"); return None
+        resp = (r.json().get("result") or {}).get("response")
+        if isinstance(resp, str):
+            resp = re.sub(r"^```(?:json)?|```$", "", resp.strip(), flags=re.M).strip()
+            resp = json.loads(resp[resp.index("{"): resp.rindex("}") + 1])
+        return resp if valid_script(resp) else None
+    except Exception as e:
+        print("  Cloudflare text error:", e); return None
 
 
 def gemini_json(prompt):
@@ -52,31 +81,38 @@ def gemini_json(prompt):
         sys.exit("GEMINI_API_KEY set karo (free: https://aistudio.google.com/apikey)")
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
-    last = ""
-    for model in gemini_models(key):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        for attempt in range(2):
+    models = gemini_models(key); skip = set(); last = ""
+    for rnd in range(4):                      # busy ho to thoda ruk ke dobara, 4 baar
+        for model in models:
+            if model in skip:
+                continue
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             try:
-                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=90)
+                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=75)
             except requests.RequestException as e:
-                last = f"{model}: {type(e).__name__} (90 sec mein jawab nahi aaya)"
-                print("  Gemini fail ->", last)
-                break      # is model ko chhodo, agla model try karo
+                last = f"{model}: {type(e).__name__}"; print("  Gemini fail ->", last); skip.add(model); continue
             if r.status_code == 200:
                 try:
                     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
                     data = json.loads(text)
-                    print(f"  Gemini model: {model}")
-                    return data
+                    if valid_script(data):
+                        print(f"  Gemini model: {model}"); return data
+                    last = f"{model}: JSON adhura tha"
                 except Exception as e:
-                    last = f"{model}: bad JSON ({e})"; print("  ", last); continue
-            last = f"{model}: HTTP {r.status_code} {r.text[:200]!r}"
+                    last = f"{model}: bad JSON ({e})"
+                print("  ", last); continue
+            last = f"{model}: HTTP {r.status_code} {r.text[:120]!r}"
             print("  Gemini fail ->", last)
-            if r.status_code in (429, 500, 503):
-                time.sleep(10); continue
-            break          # 404/400/403: is model ko chhodo, agla try karo
-    sys.exit("Gemini kisi model par nahi chala. Aakhri error: " + last)
+            if r.status_code not in (429, 500, 503):
+                skip.add(model)               # 400/403/404: is model ko chhodo
+        if rnd < 3:
+            wait = 25 * (rnd + 1); print(f"  Gemini busy, {wait} sec ruk ke dobara try..."); time.sleep(wait)
+    print("  Gemini nahi chala, Cloudflare backup writer try kar raha hu...")
+    data = cloudflare_json(prompt)
+    if data:
+        print("  Script Cloudflare (Llama) se bani"); return data
+    sys.exit("Script nahi ban payi. Gemini aakhri error: " + last)
 
 
 def write_script(topic, style, lang, fmt, n):
@@ -364,45 +400,4 @@ def main():
     ap.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
     a = ap.parse_args()
 
-    W, H = SIZES[a.format]; n = a.scenes or (12 if a.format == "short" else 18)
-    voice = a.voice or os.environ.get("VOICE") or VOICES[a.lang]
-    out = Path("output") / datetime.now().strftime("%Y%m%d_%H%M%S"); out.mkdir(parents=True, exist_ok=True)
-
-    log("Script likh raha hu (Gemini)...")
-    meta = write_script(a.topic, a.style, a.lang, a.format, n)
-    scenes = meta["scenes"]
-    (out / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    (out / "script.txt").write_text("\n\n".join(s["voice"] for s in scenes), encoding="utf-8")
-    (out / "prompts.md").write_text("\n\n".join(
-        f"## Scene {i + 1}\nVoice: {s['voice']}\nCaption: {s.get('caption', '')}\nImage prompt: {s['image_prompt']}\n"
-        f"Video prompt (Kling/Veo): {s.get('video_prompt', '')}" for i, s in enumerate(scenes)), encoding="utf-8")
-    print("  Title:", meta["title"])
-
-    clips = []
-    for i, s in enumerate(scenes):
-        log(f"Scene {i + 1}/{len(scenes)}: image + voice")
-        img = out / f"scene{i + 1}.jpg"; mp3 = out / f"scene{i + 1}.mp3"
-        make_image(s["image_prompt"], img, W, H, random.randint(1, 10**6), s.get("keywords", ""))
-        asyncio.run(tts(s["voice"], voice, mp3))
-        clips.append(build_scene(i, s.get("caption") or s["voice"], img, mp3, W, H))
-
-    log("Video jod raha hu (thoda time lagega)...")
-    final = concatenate_videoclips(clips, method="compose")
-    music = Path("music.mp3")
-    if music.exists():
-        m = AudioFileClip(str(music)).fx(afx.audio_loop, duration=final.duration).volumex(0.08)
-        final = final.set_audio(CompositeAudioClip([final.audio, m]))
-    video = out / "video.mp4"
-    final.write_videofile(str(video), fps=24, codec="libx264", audio_codec="aac", preset="veryfast",
-                          threads=2, logger=None)
-
-    log("Thumbnail bana raha hu...")
-    thumb = make_thumbnail(meta, out, random.randint(1, 10**6))
-    print(f"\n✅ Ready: {video}")
-    if a.upload:
-        log("YouTube pe upload...")
-        upload(video, thumb, meta, a.privacy)
-
-
-if __name__ == "__main__":
-    main()
+    W, H = SIZES[a.format]; n = a.scenes or (12 if a.form
