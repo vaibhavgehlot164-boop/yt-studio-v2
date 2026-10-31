@@ -1,5 +1,5 @@
 """YT Auto Studio v2: energetic comedy 3D-cartoon explainer videos. Free tools only."""
-import argparse, asyncio, base64, json, os, random, re, sys, time, urllib.parse
+import argparse, asyncio, json, os, random, sys
 from datetime import datetime
 from pathlib import Path
 
@@ -27,240 +27,8 @@ CAP_COLORS = ["#FFE600", "#FFFFFF", "#00E5FF", "#FF4D9D", "#7CFF4D"]
 def log(msg): print(f"▶ {msg}", flush=True)
 
 
-# ---------- 1. SCRIPT (Gemini free tier) ----------
-def gemini_models(key):
-    """Preferred model first, then other stable text 'flash' models this key can use (names change often)."""
-    first = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-    names = []
-    try:
-        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", headers={"x-goog-api-key": key},
-                         params={"pageSize": 200}, timeout=60)
-        for m in r.json().get("models", []):
-            n = m["name"].split("/")[-1]
-            if "generateContent" in m.get("supportedGenerationMethods", []) and "flash" in n \
-                    and not any(x in n for x in ("image", "tts", "audio", "live", "robot", "computer", "native",
-                                                 "preview", "omni", "exp")):
-                names.append(n)
-    except Exception as e:
-        print("  model list nahi mili:", e)
-    names.sort(key=lambda n: ("lite" in n, [-ord(c) for c in n]))
-    return [first] + [n for n in names if n != first][:4]
-
-
-def valid_script(d):
-    return isinstance(d, dict) and isinstance(d.get("scenes"), list) and len(d["scenes"]) > 0 \
-        and all(isinstance(x, dict) and x.get("voice") and x.get("image_prompt") for x in d["scenes"])
-
-
-def cloudflare_json(prompt):
-    """Backup writer when Gemini is overloaded: Cloudflare Workers AI (same free token as images)."""
-    acc, tok = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_API_TOKEN")
-    if not (acc and tok):
-        return None
-    model = os.environ.get("CF_TEXT_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast")
-    try:
-        r = requests.post(f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/{model}",
-                          headers={"Authorization": "Bearer " + tok},
-                          json={"messages": [{"role": "system", "content": "You output only valid JSON, nothing else."},
-                                             {"role": "user", "content": prompt}],
-                                "max_tokens": 6000, "temperature": 0.9}, timeout=180)
-        if r.status_code != 200:
-            print(f"  Cloudflare text: HTTP {r.status_code} {r.text[:150]!r}"); return None
-        resp = (r.json().get("result") or {}).get("response")
-        if isinstance(resp, str):
-            resp = re.sub(r"^```(?:json)?|```$", "", resp.strip(), flags=re.M).strip()
-            resp = json.loads(resp[resp.index("{"): resp.rindex("}") + 1])
-        return resp if valid_script(resp) else None
-    except Exception as e:
-        print("  Cloudflare text error:", e); return None
-
-
-def gemini_json(prompt):
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
-        sys.exit("GEMINI_API_KEY set karo (free: https://aistudio.google.com/apikey)")
-    body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 1.0}}
-    models = gemini_models(key); skip = set(); last = ""
-    for rnd in range(4):                      # busy ho to thoda ruk ke dobara, 4 baar
-        for model in models:
-            if model in skip:
-                continue
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-            try:
-                r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=75)
-            except requests.RequestException as e:
-                last = f"{model}: {type(e).__name__}"; print("  Gemini fail ->", last); skip.add(model); continue
-            if r.status_code == 200:
-                try:
-                    text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-                    data = json.loads(text)
-                    if valid_script(data):
-                        print(f"  Gemini model: {model}"); return data
-                    last = f"{model}: JSON adhura tha"
-                except Exception as e:
-                    last = f"{model}: bad JSON ({e})"
-                print("  ", last); continue
-            last = f"{model}: HTTP {r.status_code} {r.text[:120]!r}"
-            print("  Gemini fail ->", last)
-            if r.status_code not in (429, 500, 503):
-                skip.add(model)               # 400/403/404: is model ko chhodo
-        if rnd < 3:
-            wait = 25 * (rnd + 1); print(f"  Gemini busy, {wait} sec ruk ke dobara try..."); time.sleep(wait)
-    print("  Gemini nahi chala, Cloudflare backup writer try kar raha hu...")
-    data = cloudflare_json(prompt)
-    if data:
-        print("  Script Cloudflare (Llama) se bani"); return data
-    sys.exit("Script nahi ban payi. Gemini aakhri error: " + last)
-
-
-def write_script(topic, style, lang, fmt, n):
-    words = "110-140 words total" if fmt == "short" else "550-700 words total"
-    if lang == "english":
-        rules = '"voice": natural spoken English line. "caption": the same line (can be shortened).'
-    elif lang == "hindi":
-        rules = '"voice": Hindi in Devanagari. "caption": the same line in Devanagari.'
-    else:
-        rules = ('"voice": the line in Hindi written in DEVANAGARI script (English words like space, robot, YouTube also '
-                 'in Devanagari spelling) so a Hindi text-to-speech voice pronounces everything correctly. '
-                 '"caption": the SAME line in Hinglish using Roman letters (fun, readable on screen).')
-    prompt = f"""You are a top Indian YouTube scriptwriter making a HIGH-ENERGY, FUNNY, colorful 3D-cartoon explainer.
-Tone: fast, punchy desi comedy: playful exaggeration, relatable jokes, roast-style one-liners, rhetorical questions,
-surprise twists, a cliffhanger before each reveal. Original writing only; do not imitate any specific creator or copy any script.
-Topic: "{topic}". Style: {style}. Format: {'YouTube Short (vertical, under 50 seconds)' if fmt == 'short' else 'YouTube video 3-4 minutes'}.
-Facts must be TRUE and verifiable. Make exactly {n} scenes, {words}. Scene 1 opens with a killer hook (first 3 seconds).
-The last scene is a funny outro plus a one-line ask to like and subscribe.
-Voice lines are read by text-to-speech: short sentences (max ~12 words), write numbers as words, no emojis, no markdown,
-no brackets, no stage directions. {rules}
-Return ONLY JSON:
-{{"title": str (catchy, under 70 chars),
- "description": str (2-4 lines),
- "tags": [8 strings],
- "main_character": str (ONE recurring funny 3D cartoon character: look, outfit, colors; in English),
- "thumbnail_text": str (max 4 words, punchy, ENGLISH/ROMAN letters, curiosity or shock),
- "thumbnail_prompt": str (English: shocked/excited close-up of the main character, vivid contrasting colors, dramatic background, empty space for text, no text in image),
- "thumbnail_keywords": str (2-3 English words),
- "scenes": [{{"voice": str, "caption": str,
-   "image_prompt": str (English; MUST start with the exact main_character description, then the action, funny expression, background, camera angle, bright colorful palette; no text in image),
-   "video_prompt": str (English; 5-second camera and character motion for an AI video tool),
-   "keywords": str (2-3 English words)}}]}}"""
-    return gemini_json(prompt)
-
-
-# ---------- 2. IMAGES: Cloudflare -> Hugging Face -> Pollinations -> Pexels -> placeholder ----------
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
-STYLE = (", 3D Pixar-style animated movie render, vibrant saturated colors, soft studio lighting, "
-         "expressive funny cartoon character, ultra detailed, no text, no watermark")
-DEAD = set()
-
-
-def save_fit(data, path, w, h):
-    path.write_bytes(data)
-    ImageOps.fit(Image.open(path).convert("RGB"), (w, h), Image.LANCZOS).save(path, quality=92)
-
-
-def is_img(r):
-    return r.status_code == 200 and r.headers.get("content-type", "").startswith("image")
-
-
-def try_cloudflare(prompt, kw, w, h, seed):
-    acc, tok = os.environ.get("CF_ACCOUNT_ID"), os.environ.get("CF_API_TOKEN")
-    if not (acc and tok):
-        return None
-    model = os.environ.get("CF_MODEL", "@cf/bytedance/stable-diffusion-xl-lightning")
-    gw, gh = (w // 8) * 8, (h // 8) * 8
-    r = requests.post(f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/{model}",
-                      headers={"Authorization": "Bearer " + tok},
-                      json={"prompt": prompt + STYLE, "width": gw, "height": gh, "num_steps": 8}, timeout=180)
-    ct = r.headers.get("content-type", "")
-    if r.status_code == 200 and ct.startswith("image"):
-        return r.content
-    if r.status_code == 200 and "json" in ct:
-        b64 = (r.json().get("result") or {}).get("image")
-        if b64:
-            return base64.b64decode(b64)
-    print(f"  Cloudflare: HTTP {r.status_code} {r.text[:150]!r}")
-    if r.status_code in (400, 401, 403, 404):
-        DEAD.add("cloudflare")
-    return None
-
-
-def try_huggingface(prompt, kw, w, h, seed):
-    tok = os.environ.get("HF_TOKEN")
-    if not tok:
-        return None
-    r = requests.post("https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell",
-                      headers={"Authorization": "Bearer " + tok},
-                      json={"inputs": prompt + STYLE, "parameters": {"width": w, "height": h}}, timeout=180)
-    if is_img(r):
-        return r.content
-    print(f"  HuggingFace: HTTP {r.status_code} {r.text[:100]!r}")
-    if r.status_code in (401, 402, 403):
-        DEAD.add("huggingface")
-    return None
-
-
-def try_pollinations(prompt, kw, w, h, seed):
-    url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt + STYLE)
-           + f"?width={w}&height={h}&nologo=true&seed={seed}")
-    headers = dict(UA)
-    if os.environ.get("POLLINATIONS_KEY"):
-        headers["Authorization"] = "Bearer " + os.environ["POLLINATIONS_KEY"]
-    r = requests.get(url, headers=headers, timeout=90)
-    if is_img(r):
-        return r.content
-    print(f"  Pollinations: HTTP {r.status_code} {r.text[:100]!r}")
-    if r.status_code in (401, 403, 429):
-        DEAD.add("pollinations")
-    return None
-
-
-def try_pexels(prompt, kw, w, h, seed):
-    key = os.environ.get("PEXELS_KEY")
-    if not key:
-        return None
-    query = kw or " ".join(prompt.split()[:3])
-    r = requests.get("https://api.pexels.com/v1/search", headers={"Authorization": key},
-                     params={"query": query, "per_page": 15, "orientation": "portrait" if h > w else "landscape"}, timeout=60)
-    if r.status_code != 200:
-        print(f"  Pexels: HTTP {r.status_code} {r.text[:100]!r}")
-        if r.status_code in (401, 403):
-            DEAD.add("pexels")
-        return None
-    photos = r.json().get("photos", [])
-    if not photos:
-        return None
-    pic = random.Random(seed).choice(photos)["src"]
-    img = requests.get(pic.get("large2x") or pic["original"], timeout=90)
-    return img.content if is_img(img) else None
-
-
-PROVIDERS = [("cloudflare", try_cloudflare), ("huggingface", try_huggingface),
-             ("pollinations", try_pollinations), ("pexels", try_pexels)]
-
-
-def make_image(prompt, path, w, h, seed, kw=""):
-    for attempt in range(2):
-        for name, fn in PROVIDERS:
-            if name in DEAD:
-                continue
-            try:
-                data = fn(prompt, kw, w, h, seed)
-                if data:
-                    save_fit(data, path, w, h)
-                    print(f"  image: {name} OK")
-                    return
-            except Exception as e:
-                print(f"  {name} error:", e)
-        time.sleep(3)
-    print("  ⚠ image fail, placeholder use kar raha hu")
-    rnd = random.Random(seed)
-    top, bot = [tuple(rnd.randint(20, 120) for _ in range(3)) for _ in range(2)]
-    arr = np.zeros((h, w, 3), dtype=np.uint8)
-    for c in range(3):
-        arr[:, :, c] = np.linspace(top[c], bot[c], h)[:, None]
-    Image.fromarray(arr).save(path, quality=92)
+from scriptgen import write_script
+from imagegen import make_image
 
 
 # ---------- 3. VOICEOVER (edge-tts, free, energetic settings) ----------
@@ -400,4 +168,46 @@ def main():
     ap.add_argument("--privacy", default="private", choices=["private", "unlisted", "public"])
     a = ap.parse_args()
 
-    W, H = SIZES[a.format]; n = a.scenes or (12 if a.form
+    W, H = SIZES[a.format]; n = a.scenes or (12 if a.format == "short" else 18)
+    voice = a.voice or os.environ.get("VOICE") or VOICES[a.lang]
+    out = Path("output") / datetime.now().strftime("%Y%m%d_%H%M%S"); out.mkdir(parents=True, exist_ok=True)
+
+    log("Script likh raha hu (Gemini)...")
+    meta = write_script(a.topic, a.style, a.lang, a.format, n)
+    scenes = meta["scenes"]
+    (out / "metadata.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out / "script.txt").write_text("\n\n".join(s["voice"] for s in scenes), encoding="utf-8")
+    (out / "prompts.md").write_text("\n\n".join(
+        f"## Scene {i + 1}\nVoice: {s['voice']}\nCaption: {s.get('caption', '')}\nImage prompt: {s['image_prompt']}\n"
+        f"Video prompt (Kling/Veo): {s.get('video_prompt', '')}" for i, s in enumerate(scenes)), encoding="utf-8")
+    print("  Title:", meta["title"])
+
+    clips = []
+    for i, s in enumerate(scenes):
+        log(f"Scene {i + 1}/{len(scenes)}: image + voice")
+        img = out / f"scene{i + 1}.jpg"; mp3 = out / f"scene{i + 1}.mp3"
+        make_image(s["image_prompt"], img, W, H, random.randint(1, 10**6), s.get("keywords", ""))
+        asyncio.run(tts(s["voice"], voice, mp3))
+        clips.append(build_scene(i, s.get("caption") or s["voice"], img, mp3, W, H))
+
+    log("Video jod raha hu (thoda time lagega)...")
+    final = concatenate_videoclips(clips, method="compose")
+    music = Path("music.mp3")
+    if music.exists():
+        m = AudioFileClip(str(music)).fx(afx.audio_loop, duration=final.duration).volumex(0.08)
+        final = final.set_audio(CompositeAudioClip([final.audio, m]))
+    video = out / "video.mp4"
+    final.write_videofile(str(video), fps=24, codec="libx264", audio_codec="aac", preset="veryfast",
+                          threads=2, logger=None)
+
+    log("Thumbnail bana raha hu...")
+    thumb = make_thumbnail(meta, out, random.randint(1, 10**6))
+    print(f"\n✅ Ready: {video}")
+    if a.upload:
+        log("YouTube pe upload...")
+        upload(video, thumb, meta, a.privacy)
+
+
+if __name__ == "__main__":
+    main()
+    
